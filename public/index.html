@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14213d">
+<meta name="mobile-web-app-capable" content="yes">
+<title>HRIS with SMS Integration</title>
+<meta name="theme-color" content="#14213d">
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-view" class="login-wrap" hidden>
+  <form id="login-form" class="card login-card">
+    <h1>HRIS</h1>
+    <p class="muted">Human Resource Information System<br>with SMS Integration</p>
+    <label>Username <input name="username" autocomplete="username" required autofocus></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <p id="login-error" class="error"></p>
+    <button class="btn primary" type="submit">Sign in</button>
+    <details class="demo">
+      <summary>Demo accounts</summary>
+      <table>
+        <tr><td>admin</td><td>admin123</td><td>Admin</td></tr>
+        <tr><td>hr</td><td>hr123</td><td>HR Staff</td></tr>
+        <tr><td>juan</td><td>emp123</td><td>Employee</td></tr>
+        <tr><td>ana</td><td>emp123</td><td>Employee</td></tr>
+      </table>
+    </details>
+  </form>
+</div>
+
+<!-- App -->
+<div id="app-view" hidden>
+  <aside class="sidebar">
+    <div class="brand">HRIS<span>+SMS</span></div>
+    <button id="menu-btn" class="menu-btn" aria-label="Menu" aria-expanded="false">&#9776;</button>
+    <button id="menu-btn" class="menu-btn" aria-label="Menu" aria-expanded="false">&#9776;</button>
+    <nav id="nav"></nav>
+    <div class="who">
+      <div id="who-name"></div>
+      <div id="who-role" class="muted small"></div>
+      <button id="logout" class="btn small">Log out</button>
+    </div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<!-- Modal -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-box card">
+    <h2 id="modal-title"></h2>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

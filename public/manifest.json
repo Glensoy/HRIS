@@ -1,0 +1,9 @@
+{
+  "name": "HRIS with SMS",
+  "short_name": "HRIS",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#14213d",
+  "theme_color": "#14213d",
+  "icons": []
+}
