@@ -1,0 +1,14 @@
+# Ignore node dependencies
+node_modules/
+
+# Ignore local environment variables
+.env
+
+# Ignore local SQLite databases / cache files
+*.db
+*.db-shm
+*.db-wal
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
