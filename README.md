@@ -64,7 +64,3 @@ Employees can opt out of SMS on their profile. Every attempt, successful or not,
 - Every API route checks authentication and role on the server.
 - Sensitive actions are recorded in the Audit Log (Admin only).
 - Before production: set a strong `SESSION_SECRET`, serve over HTTPS (and set `cookie.secure`), add login rate limiting, and change the demo passwords.
-
-## Out of scope (per the paper)
-
-No payroll or live monetary transactions, and no automated SSS / PhilHealth / Pag-IBIG remittances.
