@@ -98,6 +98,42 @@ CREATE TABLE IF NOT EXISTS sms_log (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+
+CREATE TABLE IF NOT EXISTS shifts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT UNIQUE NOT NULL,
+  start_time TEXT NOT NULL,             -- HH:MM (24h)
+  end_time TEXT NOT NULL,
+  work_days TEXT NOT NULL DEFAULT '1,2,3,4,5',   -- 0=Sun ... 6=Sat
+  grace_minutes INTEGER NOT NULL DEFAULT 10
+);
+
+CREATE TABLE IF NOT EXISTS shift_assignments (
+  employee_id INTEGER PRIMARY KEY REFERENCES employees(id) ON DELETE CASCADE,
+  shift_id INTEGER NOT NULL REFERENCES shifts(id)
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+  work_date TEXT NOT NULL,              -- YYYY-MM-DD
+  time_in TEXT,                         -- HH:MM
+  time_out TEXT,
+  status TEXT NOT NULL DEFAULT 'Present' CHECK (status IN ('Present','Late')),
+  remarks TEXT,
+  UNIQUE(employee_id, work_date)
+);
+
+CREATE TABLE IF NOT EXISTS payroll_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  period_label TEXT NOT NULL,           -- e.g. "Nov 1-15, 2026"
+  pay_date TEXT,
+  status TEXT NOT NULL CHECK (status IN ('Processing','Released','Delayed')),
+  note TEXT,
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id),
@@ -144,5 +180,18 @@ function seed() {
   console.log('Seeded database with default roles, departments, leave types and demo accounts.');
 }
 seed();
+
+// Extra seed (safe on an existing database): default shifts, assigned to everyone without one
+function seedShifts() {
+  if (!db.prepare('SELECT COUNT(*) c FROM shifts').get().c) {
+    const ins = db.prepare('INSERT INTO shifts (name, start_time, end_time, work_days, grace_minutes) VALUES (?,?,?,?,?)');
+    ins.run('Day Shift', '08:00', '17:00', '1,2,3,4,5', 10);
+    ins.run('Mid Shift', '10:00', '19:00', '1,2,3,4,5', 10);
+    ins.run('Night Shift', '22:00', '06:00', '1,2,3,4,5', 10);
+  }
+  db.prepare(`INSERT OR IGNORE INTO shift_assignments (employee_id, shift_id)
+    SELECT e.id, (SELECT id FROM shifts ORDER BY id LIMIT 1) FROM employees e`).run();
+}
+seedShifts();
 
 module.exports = db;

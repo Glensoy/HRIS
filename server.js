@@ -121,6 +121,7 @@ app.post('/api/employees', requireAuth, requireRole('Admin', 'HR Staff'), wrap((
       b.email || null, b.mobile || null, b.department_id || null, b.position || null, b.date_hired || null);
     db.prepare(`INSERT INTO leave_balances (employee_id, leave_type_id, year, days_allowed)
       SELECT ?, id, ?, default_days FROM leave_types`).run(e.lastInsertRowid, new Date().getFullYear());
+    db.prepare('INSERT OR IGNORE INTO shift_assignments (employee_id, shift_id) SELECT ?, MIN(id) FROM shifts').run(e.lastInsertRowid);
     return e.lastInsertRowid;
   });
   const id = tx();
@@ -291,6 +292,188 @@ app.post('/api/sms-test', requireAuth, requireRole('Admin'), wrap(async (req, re
   res.json(await sms.sendSMS({ mobile, message: message || 'HRIS test message.', trigger: 'test' }));
 }));
 
+
+// ================= Shifts, Attendance, Payroll updates, Python report =================
+const { execFile } = require('child_process');
+const pad2 = (n) => String(n).padStart(2, '0');
+const localDate = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const localTime = (d = new Date()) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const toMin = (t) => { const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+const validTime = (t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(t || '');
+const validDate = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && !isNaN(new Date(d));
+
+function shiftFor(employeeId) {
+  return db.prepare(`SELECT s.* FROM shift_assignments sa JOIN shifts s ON s.id = sa.shift_id WHERE sa.employee_id = ?`).get(employeeId);
+}
+// Late if clock-in is more than grace minutes after the shift start (handles night shifts via modulo)
+function statusFor(shift, timeIn) {
+  if (!shift || !timeIn) return 'Present';
+  const diff = ((toMin(timeIn) - toMin(shift.start_time) + 720) % 1440 + 1440) % 1440 - 720;
+  return diff > shift.grace_minutes ? 'Late' : 'Present';
+}
+const onApprovedLeave = (employeeId, date) =>
+  !!db.prepare("SELECT 1 FROM leave_requests WHERE employee_id = ? AND status = 'Approved' AND ? BETWEEN start_date AND end_date").get(employeeId, date);
+
+// ---------- Shifts ----------
+app.get('/api/shifts', requireAuth, (req, res) => {
+  res.json(db.prepare(`SELECT s.*, (SELECT COUNT(*) FROM shift_assignments sa WHERE sa.shift_id = s.id) AS assigned FROM shifts s ORDER BY s.start_time`).all());
+});
+function shiftBody(b) {
+  if (!b.name || !validTime(b.start_time) || !validTime(b.end_time)) throw new Error('Shift name and valid start/end times (HH:MM) are required.');
+  const days = (Array.isArray(b.work_days) ? b.work_days : String(b.work_days || '').split(',')).map(Number).filter(n => n >= 0 && n <= 6);
+  if (!days.length) throw new Error('Pick at least one work day.');
+  const grace = Math.max(0, Math.min(120, Number(b.grace_minutes) || 0));
+  return [b.name.trim(), b.start_time, b.end_time, [...new Set(days)].sort().join(','), grace];
+}
+app.post('/api/shifts', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  const r = db.prepare('INSERT INTO shifts (name, start_time, end_time, work_days, grace_minutes) VALUES (?,?,?,?,?)').run(...shiftBody(req.body));
+  audit(req.session.user.id, 'create_shift', `shift ${r.lastInsertRowid}`);
+  res.json({ id: r.lastInsertRowid });
+}));
+app.put('/api/shifts/:id', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  db.prepare('UPDATE shifts SET name=?, start_time=?, end_time=?, work_days=?, grace_minutes=? WHERE id=?').run(...shiftBody(req.body), req.params.id);
+  audit(req.session.user.id, 'update_shift', `shift ${req.params.id}`);
+  res.json({ ok: true });
+}));
+app.delete('/api/shifts/:id', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  const n = db.prepare('SELECT COUNT(*) c FROM shift_assignments WHERE shift_id = ?').get(req.params.id).c;
+  if (n) return res.status(400).json({ error: `${n} employee(s) are still assigned to this shift. Reassign them first.` });
+  db.prepare('DELETE FROM shifts WHERE id = ?').run(req.params.id);
+  audit(req.session.user.id, 'delete_shift', `shift ${req.params.id}`);
+  res.json({ ok: true });
+}));
+app.get('/api/schedule', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  res.json(db.prepare(`SELECT e.id, e.employee_no, e.first_name || ' ' || e.last_name AS name, d.name AS department, sa.shift_id
+    FROM employees e JOIN users u ON u.id = e.user_id AND u.is_active = 1
+    LEFT JOIN departments d ON d.id = e.department_id LEFT JOIN shift_assignments sa ON sa.employee_id = e.id
+    ORDER BY e.last_name, e.first_name`).all());
+});
+app.put('/api/schedule/:employeeId', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  const shiftId = Number(req.body.shift_id);
+  if (!db.prepare('SELECT 1 FROM shifts WHERE id = ?').get(shiftId)) return res.status(400).json({ error: 'Shift not found.' });
+  if (!db.prepare('SELECT 1 FROM employees WHERE id = ?').get(req.params.employeeId)) return res.status(404).json({ error: 'Employee not found.' });
+  db.prepare('INSERT INTO shift_assignments (employee_id, shift_id) VALUES (?, ?) ON CONFLICT(employee_id) DO UPDATE SET shift_id = excluded.shift_id').run(req.params.employeeId, shiftId);
+  audit(req.session.user.id, 'assign_shift', `employee ${req.params.employeeId} -> shift ${shiftId}`);
+  res.json({ ok: true });
+}));
+
+// ---------- Attendance (employee self-service) ----------
+app.get('/api/attendance/today', requireAuth, (req, res) => {
+  const id = req.session.user.employeeId, today = localDate();
+  const rec = db.prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?').get(id, today);
+  const open = db.prepare('SELECT * FROM attendance WHERE employee_id = ? AND time_out IS NULL AND time_in IS NOT NULL ORDER BY work_date DESC LIMIT 1').get(id);
+  res.json({ today, now: localTime(), record: rec || null, open: open || null, shift: shiftFor(id) || null, onLeave: onApprovedLeave(id, today) });
+});
+
+app.post('/api/attendance/clock-in', requireAuth, wrap((req, res) => {
+  const id = req.session.user.employeeId, today = localDate(), now = localTime();
+  if (onApprovedLeave(id, today)) return res.status(400).json({ error: 'You are on approved leave today.' });
+  if (db.prepare('SELECT 1 FROM attendance WHERE employee_id = ? AND work_date = ?').get(id, today)) return res.status(400).json({ error: 'You already clocked in today.' });
+  const open = db.prepare('SELECT work_date FROM attendance WHERE employee_id = ? AND time_out IS NULL AND time_in IS NOT NULL').get(id);
+  if (open) return res.status(400).json({ error: `Please clock out first (open record from ${open.work_date}).` });
+  const status = statusFor(shiftFor(id), now);
+  db.prepare('INSERT INTO attendance (employee_id, work_date, time_in, status) VALUES (?,?,?,?)').run(id, today, now, status);
+  audit(req.session.user.id, 'clock_in', `${today} ${now} ${status}`);
+  res.json({ ok: true, time_in: now, status });
+}));
+
+app.post('/api/attendance/clock-out', requireAuth, wrap((req, res) => {
+  const id = req.session.user.employeeId, now = localTime();
+  const open = db.prepare('SELECT * FROM attendance WHERE employee_id = ? AND time_out IS NULL AND time_in IS NOT NULL ORDER BY work_date DESC LIMIT 1').get(id);
+  if (!open) return res.status(400).json({ error: 'You have not clocked in.' });
+  db.prepare('UPDATE attendance SET time_out = ? WHERE id = ?').run(now, open.id);
+  audit(req.session.user.id, 'clock_out', `${open.work_date} ${now}`);
+  res.json({ ok: true, time_out: now });
+}));
+
+app.get('/api/attendance/mine', requireAuth, (req, res) => {
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : localDate().slice(0, 7);
+  res.json(db.prepare("SELECT * FROM attendance WHERE employee_id = ? AND substr(work_date,1,7) = ? ORDER BY work_date DESC").all(req.session.user.employeeId, month));
+});
+
+// ---------- Attendance (HR/Admin) ----------
+app.get('/api/attendance', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  const date = validDate(req.query.date) ? req.query.date : localDate();
+  const dow = new Date(date + 'T00:00:00').getDay();
+  const rows = db.prepare(`
+    SELECT e.id AS employee_id, e.employee_no, e.first_name || ' ' || e.last_name AS name, d.name AS department,
+           s.name AS shift, s.start_time, s.end_time, s.work_days, a.time_in, a.time_out, a.status AS att_status, a.remarks
+    FROM employees e JOIN users u ON u.id = e.user_id AND u.is_active = 1
+    LEFT JOIN departments d ON d.id = e.department_id
+    LEFT JOIN shift_assignments sa ON sa.employee_id = e.id LEFT JOIN shifts s ON s.id = sa.shift_id
+    LEFT JOIN attendance a ON a.employee_id = e.id AND a.work_date = ?
+    ORDER BY e.last_name, e.first_name`).all(date);
+  const today = localDate();
+  res.json({ date, rows: rows.map(r => {
+    const workDays = (r.work_days || '1,2,3,4,5').split(',').map(Number);
+    let status;
+    if (r.time_in) status = r.att_status;
+    else if (onApprovedLeave(r.employee_id, date)) status = 'On Leave';
+    else if (!workDays.includes(dow)) status = 'Day off';
+    else status = date > today ? 'Scheduled' : date === today ? 'Not yet in' : 'Absent';
+    return { ...r, status };
+  }) });
+});
+
+// HR/Admin can add or correct a record (e.g. forgot to clock out)
+app.put('/api/attendance', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  const { employee_id, work_date, time_in, time_out, remarks } = req.body;
+  if (!employee_id || !validDate(work_date) || !validTime(time_in)) return res.status(400).json({ error: 'Employee, date and a valid time-in are required.' });
+  if (time_out && !validTime(time_out)) return res.status(400).json({ error: 'Invalid time-out.' });
+  const status = statusFor(shiftFor(employee_id), time_in);
+  db.prepare(`INSERT INTO attendance (employee_id, work_date, time_in, time_out, status, remarks) VALUES (?,?,?,?,?,?)
+    ON CONFLICT(employee_id, work_date) DO UPDATE SET time_in = excluded.time_in, time_out = excluded.time_out, status = excluded.status, remarks = excluded.remarks`)
+    .run(employee_id, work_date, time_in, time_out || null, status, remarks || null);
+  audit(req.session.user.id, 'edit_attendance', `employee ${employee_id} ${work_date}`);
+  res.json({ ok: true, status });
+}));
+
+// ---------- Payroll processing updates (status notices only: no amounts, no money handling) ----------
+app.get('/api/payroll', requireAuth, (req, res) => {
+  res.json(db.prepare(`SELECT p.*, u.username AS author FROM payroll_updates p JOIN users u ON u.id = p.created_by ORDER BY p.id DESC LIMIT 30`).all());
+});
+app.post('/api/payroll', requireAuth, requireRole('Admin', 'HR Staff'), wrap(async (req, res) => {
+  const { period_label, pay_date, status, note, send_sms } = req.body;
+  if (!period_label || !['Processing', 'Released', 'Delayed'].includes(status)) return res.status(400).json({ error: 'Pay period and a valid status are required.' });
+  if (pay_date && !validDate(pay_date)) return res.status(400).json({ error: 'Invalid pay date.' });
+  const r = db.prepare('INSERT INTO payroll_updates (period_label, pay_date, status, note, created_by) VALUES (?,?,?,?,?)')
+    .run(period_label.trim(), pay_date || null, status, note || null, req.session.user.id);
+  audit(req.session.user.id, 'payroll_update', `${period_label} -> ${status}`);
+  let sent = 0, failed = 0;
+  if (send_sms) {
+    const targets = db.prepare(`SELECT e.id FROM employees e JOIN users u ON u.id = e.user_id WHERE u.is_active = 1 AND e.sms_opt_in = 1 AND e.mobile IS NOT NULL`).all();
+    const text = `HRIS Payroll: ${period_label} is ${status.toUpperCase()}.` + (pay_date ? ` Pay date: ${pay_date}.` : '') + (note ? ` ${note}` : '');
+    for (const t of targets) { const out = await sms.notifyEmployee(t.id, text.slice(0, 450), 'payroll'); out.ok ? sent++ : failed++; }
+  }
+  res.json({ id: r.lastInsertRowid, sms: { sent, failed } });
+}));
+app.delete('/api/payroll/:id', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  db.prepare('DELETE FROM payroll_updates WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------- Python-powered attendance report ----------
+const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+app.get('/api/reports/attendance', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month || '') ? req.query.month : localDate().slice(0, 7);
+  const format = req.query.format === 'csv' ? 'csv' : 'json';
+  const script = path.join(__dirname, 'reports', 'attendance_report.py');
+  execFile(PYTHON, [script, '--db', path.join(__dirname, 'hris.db'), '--month', month, '--format', format, '--today', localDate()],
+    { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const missing = err.code === 'ENOENT';
+        console.error('[report]', err.message, stderr);
+        return res.status(500).json({ error: missing ? `Python was not found (tried "${PYTHON}"). Install Python 3 or set PYTHON in .env.` : `Report failed: ${(stderr || err.message).slice(0, 300)}` });
+      }
+      if (format === 'csv') {
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="attendance-${month}.csv"`);
+        return res.send(stdout);
+      }
+      res.type('json').send(stdout);
+    });
+});
+
 // ---------- Dashboard stats ----------
 app.get('/api/dashboard', requireAuth, (req, res) => {
   const u = req.session.user;
@@ -300,6 +483,8 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
       pending: db.prepare("SELECT COUNT(*) c FROM leave_requests WHERE status='Pending'").get().c,
       onLeaveToday: db.prepare("SELECT COUNT(*) c FROM leave_requests WHERE status='Approved' AND date('now','localtime') BETWEEN start_date AND end_date").get().c,
       smsToday: db.prepare("SELECT COUNT(*) c FROM sms_log WHERE date(created_at) = date('now')").get().c,
+      presentToday: db.prepare("SELECT COUNT(*) c FROM attendance WHERE work_date = ?").get(localDate()).c,
+      lateToday: db.prepare("SELECT COUNT(*) c FROM attendance WHERE work_date = ? AND status = 'Late'").get(localDate()).c,
     });
   } else {
     const mine = db.prepare('SELECT status, COUNT(*) c FROM leave_requests WHERE employee_id = ? GROUP BY status').all(u.employeeId);

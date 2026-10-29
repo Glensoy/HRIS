@@ -199,3 +199,22 @@ table.t th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; 
   table.t td.actions::before, table.t td:empty { display: none; }
 }
 @media (max-width: 380px) { .stats { grid-template-columns: 1fr; } }
+
+/* ===== attendance / payroll additions ===== */
+.clock-card { text-align: center; }
+.clock { font-size: 44px; font-weight: 700; letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.b-Present, .b-Released { background: #d9f5e5; color: #0e6a3c; }
+.b-Late, .b-Processing, .b-Not-yet-in { background: #fff3d6; color: #8a5a00; }
+.b-Absent, .b-Delayed { background: #fde0dc; color: #a12b1f; }
+.b-On-Leave, .b-Day-off, .b-Scheduled { background: #e1e9ff; color: #1f3f99; }
+@media (prefers-color-scheme: dark) {
+  .b-Present, .b-Released { background: #12392a; color: #7fe0ab; }
+  .b-Late, .b-Processing, .b-Not-yet-in { background: #4a3a10; color: #f5d27a; }
+  .b-Absent, .b-Delayed { background: #4a1d19; color: #ff9a8f; }
+  .b-On-Leave, .b-Day-off, .b-Scheduled { background: #1d2a4d; color: #a9c0ff; }
+}
+@media (max-width: 760px) { .clock { font-size: 38px; } .clock-card .actions .btn { flex: 1; } }
+
+.cv { display: block; }
+@media (max-width: 760px) { table.t td .cv { text-align: right; min-width: 0; } }

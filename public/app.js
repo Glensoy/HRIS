@@ -23,7 +23,7 @@ function openModal(title, html) { $('#modal-title').textContent = title; $('#mod
 function closeModal() { $('#modal').hidden = true; }
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 
-const badge = (s) => `<span class="badge b-${esc(s)}">${esc(s)}</span>`;
+const badge = (s) => `<span class="badge b-${esc(String(s).replace(/\s+/g, "-"))}">${esc(s)}</span>`;
 const fmtDate = (d) => d ? new Date(d.length <= 10 ? d + 'T00:00:00' : d.replace(' ', 'T') + 'Z').toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '';
 const fmtDT = (d) => d ? new Date(d.replace(' ', 'T') + 'Z').toLocaleString('en-PH') : '';
 const opts = (arr, sel, blank) => (blank ? `<option value="">${blank}</option>` : '') +
@@ -37,6 +37,11 @@ const PAGES = {
   dashboard: { label: 'Dashboard', render: renderDashboard },
   leave: { label: 'My Leave', render: renderMyLeave },
   approvals: { label: 'Leave Approvals', staff: true, render: renderApprovals },
+  myattendance: { label: 'My Attendance', render: renderMyAttendance },
+  attendance: { label: 'Attendance', staff: true, render: renderAttendanceAdmin },
+  shifts: { label: 'Shifts & Schedule', staff: true, render: renderShifts },
+  payroll: { label: 'Payroll Updates', render: renderPayroll },
+  reports: { label: 'Reports', staff: true, render: renderReports },
   employees: { label: 'Employees', staff: true, render: renderEmployees },
   announcements: { label: 'Announcements', render: renderAnnouncements },
   smslog: { label: 'SMS Log', staff: true, render: renderSmsLog },
@@ -80,7 +85,7 @@ function labelTables() {
 }
 new MutationObserver(labelTables).observe(document.getElementById('main'), { childList: true, subtree: true });
 function go(p) {
-  page = p;
+  page = p; clearInterval(clockTimer);
   document.querySelector('.sidebar').classList.remove('open'); $('#menu-btn').setAttribute('aria-expanded', 'false'); window.scrollTo(0, 0);
   document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('active', b.dataset.p === p));
   guard(PAGES[p].render)();
@@ -97,10 +102,10 @@ $('#logout').addEventListener('click', async () => { await api('/api/logout', 'P
 
 // ---------- Dashboard ----------
 async function renderDashboard() {
-  const [d, ann] = await Promise.all([api('/api/dashboard'), api('/api/announcements')]);
+  const [d, ann, pay] = await Promise.all([api('/api/dashboard'), api('/api/announcements'), api('/api/payroll')]);
   let stats;
   if (isStaff()) {
-    stats = [['Active employees', d.employees], ['Pending leave requests', d.pending], ['On leave today', d.onLeaveToday], ['SMS sent today', d.smsToday]];
+    stats = [['Active employees', d.employees], ['Pending leave requests', d.pending], ['On leave today', d.onLeaveToday], ['Present today', d.presentToday], ['Late today', d.lateToday], ['SMS sent today', d.smsToday]];
   } else {
     stats = [['Pending', d.mine.Pending || 0], ['Approved', d.mine.Approved || 0], ['Rejected', d.mine.Rejected || 0]];
   }
@@ -108,6 +113,7 @@ async function renderDashboard() {
     <div class="page-head"><h2>Welcome, ${esc(me.name.split(' ')[0])}</h2>
       <span class="muted small">SMS provider: <b>${esc(lookups.smsProvider)}</b>${lookups.smsProvider === 'sandbox' ? ' (messages are logged, not sent)' : ''}</span></div>
     <div class="grid stats">${stats.map(([l, n]) => `<div class="card stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('')}</div>
+    ${pay[0] ? `<div class="card" style="margin-bottom:14px"><h3>Payroll update</h3><b>${esc(pay[0].period_label)}</b> ${badge(pay[0].status)}${pay[0].pay_date ? ' <span class="muted small">Pay date ' + fmtDate(pay[0].pay_date) + '</span>' : ''}${pay[0].note ? '<p>' + esc(pay[0].note) + '</p>' : ''}</div>` : ''}
     <div class="card"><h3>Latest announcements</h3>${annList(ann.slice(0, 3), false) || '<p class="muted">Nothing posted yet.</p>'}</div>`;
 }
 
@@ -138,7 +144,9 @@ function leaveTable(rows, review) {
       <td>${esc(r.reason || '')}${r.review_remarks ? `<div class="muted small">HR: ${esc(r.review_remarks)}</div>` : ''}</td>
       <td>${badge(r.status)}</td>
       <td class="actions">${r.status === 'Pending' ? (review
-        ? `<button class="btn small ok" data-review="${r.id}" data-d="Approved">Approve</button><button class="btn small bad" data-review="${r.id}" data-d="Rejected">Reject</button>`
+        ? (r.employee_id === me.employeeId
+          ? '<span class="muted small">Your own request &ndash; another reviewer must decide</span>'
+          : `<button class="btn small ok" data-review="${r.id}" data-d="Approved">Approve</button><button class="btn small bad" data-review="${r.id}" data-d="Rejected">Reject</button>`)
         : `<button class="btn small" data-cancel="${r.id}">Cancel</button>`) : ''}</td></tr>`).join('')}
     </tbody></table></div>`;
 }
@@ -325,8 +333,204 @@ $('#menu-btn').addEventListener('click', () => {
 function labelTables() {
   document.querySelectorAll('table.t').forEach(t => {
     const heads = [...t.querySelectorAll('thead th')].map(th => th.textContent.trim());
-    t.querySelectorAll('tbody tr').forEach(tr => [...tr.children].forEach((td, i) => { if (heads[i] !== undefined) td.dataset.label = heads[i]; }));
+    t.querySelectorAll('tbody tr').forEach(tr => [...tr.children].forEach((td, i) => {
+      if (heads[i] === undefined) return;
+      td.dataset.label = heads[i];
+      // group multi-part cells (name + sub-line) into one block so the mobile card layout keeps them together
+      if (!td.classList.contains('actions') && td.childNodes.length > 1 && !td.querySelector(':scope > .cv')) {
+        const span = document.createElement('span'); span.className = 'cv';
+        while (td.firstChild) span.appendChild(td.firstChild);
+        td.appendChild(span);
+      }
+    }));
   });
 }
 new MutationObserver(labelTables).observe($('#main'), { childList: true, subtree: true });
 if ('serviceWorker' in navigator) { /* reserved for offline support */ }
+
+// =====================================================================
+// Attendance, Shifts, Payroll updates, Reports (Python)
+// =====================================================================
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const ymLocal = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+const dayLocal = (d = new Date()) => `${ymLocal(d)}-${String(d.getDate()).padStart(2, '0')}`;
+const hoursBetween = (a, b) => {
+  if (!a || !b) return '';
+  const m = (t) => +t.slice(0, 2) * 60 + +t.slice(3);
+  let diff = m(b) - m(a); if (diff < 0) diff += 1440;
+  return (diff / 60).toFixed(1);
+};
+const dayNames = (csv) => csv.split(',').map(n => DAYS[+n]).join(' ');
+let clockTimer = null, attMonth = ymLocal();
+
+// ---------- My Attendance (clock in / out) ----------
+async function renderMyAttendance() {
+  const [t, rows] = await Promise.all([api('/api/attendance/today'), api('/api/attendance/mine?month=' + attMonth)]);
+  const canIn = !t.record && !t.open && !t.onLeave, canOut = !!t.open;
+  let msg = '';
+  if (t.onLeave) msg = 'You are on approved leave today.';
+  else if (t.open) msg = `Clocked in at <b>${esc(t.open.time_in)}</b>${t.open.status === 'Late' ? ' (late)' : ''}. Don\'t forget to clock out.`;
+  else if (t.record && t.record.time_out) msg = `Done for today: ${esc(t.record.time_in)} to ${esc(t.record.time_out)}.`;
+  main().innerHTML = `
+    <div class="page-head"><h2>My Attendance</h2></div>
+    <div class="card clock-card">
+      <div id="clock" class="clock"></div>
+      <div class="muted">${new Date().toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</div>
+      <p>${t.shift ? `Shift: <b>${esc(t.shift.name)}</b> ${esc(t.shift.start_time)}&ndash;${esc(t.shift.end_time)} &middot; ${dayNames(t.shift.work_days)}` : '<span class="muted">No shift assigned yet.</span>'}</p>
+      <p>${msg}</p>
+      <div class="actions" style="justify-content:center">
+        <button class="btn ok" id="clock-in" ${canIn ? '' : 'disabled'}>Clock in</button>
+        <button class="btn bad" id="clock-out" ${canOut ? '' : 'disabled'}>Clock out</button>
+      </div>
+      <p class="muted small">Times are recorded by the server when you press the button.</p>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <div class="page-head"><h3 style="margin:0">My records</h3>
+        <input type="month" id="att-month" value="${attMonth}" style="max-width:180px"></div>
+      ${rows.length ? `<div class="table-wrap"><table class="t"><thead><tr><th>Date</th><th>Time in</th><th>Time out</th><th>Hours</th><th>Status</th></tr></thead><tbody>
+        ${rows.map(r => `<tr><td>${fmtDate(r.work_date)}</td><td>${esc(r.time_in || '')}</td><td>${esc(r.time_out || '')}</td><td>${hoursBetween(r.time_in, r.time_out)}</td><td>${badge(r.status)}</td></tr>`).join('')}
+        </tbody></table></div>` : '<p class="muted">No records for this month.</p>'}
+    </div>`;
+  const tick = () => { const el = $('#clock'); if (el) el.textContent = new Date().toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
+  tick(); clearInterval(clockTimer); clockTimer = setInterval(tick, 1000);
+  $('#clock-in').onclick = guard(async () => { const r = await api('/api/attendance/clock-in', 'POST'); toast(`Clocked in at ${r.time_in}${r.status === 'Late' ? ' (late)' : ''}.`); renderMyAttendance(); });
+  $('#clock-out').onclick = guard(async () => { const r = await api('/api/attendance/clock-out', 'POST'); toast(`Clocked out at ${r.time_out}.`); renderMyAttendance(); });
+  $('#att-month').onchange = (e) => { if (/^\d{4}-\d{2}$/.test(e.target.value)) { attMonth = e.target.value; guard(renderMyAttendance)(); } };
+}
+
+// ---------- Attendance (HR / Admin) ----------
+let attDate = dayLocal();
+async function renderAttendanceAdmin() {
+  const d = await api('/api/attendance?date=' + attDate);
+  const count = (s) => d.rows.filter(r => r.status === s).length;
+  main().innerHTML = `
+    <div class="page-head"><h2>Attendance</h2><input type="date" id="att-date" value="${d.date}" style="max-width:190px"></div>
+    <div class="grid stats">
+      ${[['Present', count('Present')], ['Late', count('Late')], ['On leave', count('On Leave')], ['Absent', count('Absent')]]
+        .map(([l, n]) => `<div class="card stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('')}
+    </div>
+    <div class="card"><div class="table-wrap"><table class="t"><thead><tr><th>Employee</th><th>Shift</th><th>Time in</th><th>Time out</th><th>Hours</th><th>Status</th><th></th></tr></thead><tbody>
+    ${d.rows.map(r => `<tr><td>${esc(r.name)}<div class="muted small">${esc(r.department || '')}</div></td>
+      <td>${esc(r.shift || '—')}${r.start_time ? `<div class="muted small">${esc(r.start_time)}&ndash;${esc(r.end_time)}</div>` : ''}</td>
+      <td>${esc(r.time_in || '')}</td><td>${esc(r.time_out || '')}</td><td>${hoursBetween(r.time_in, r.time_out)}</td><td>${badge(r.status)}</td>
+      <td class="actions"><button class="btn small" data-fix="${r.employee_id}">${r.time_in ? 'Edit' : 'Add'}</button></td></tr>`).join('')}
+    </tbody></table></div></div>`;
+  $('#att-date').onchange = (e) => { if (e.target.value) { attDate = e.target.value; guard(renderAttendanceAdmin)(); } };
+  main().querySelectorAll('[data-fix]').forEach(b => b.onclick = () => attModal(d.rows.find(r => r.employee_id == b.dataset.fix), d.date));
+}
+function attModal(r, date) {
+  openModal(`${r.time_in ? 'Edit' : 'Add'} attendance`, `<form id="atf" class="form-grid">
+    <p class="full muted">${esc(r.name)} &middot; ${fmtDate(date)}</p>
+    <label>Time in<input type="time" name="time_in" value="${esc(r.time_in || '')}" required></label>
+    <label>Time out<input type="time" name="time_out" value="${esc(r.time_out || '')}"></label>
+    <label class="full">Remarks (reason for correction)<input name="remarks" value="${esc(r.remarks || '')}"></label>
+    <p class="muted small full">Late/on-time status is recalculated from the employee's shift. Corrections are saved in the Audit Log.</p>
+    <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Save</button></div></form>`);
+  $('#atf').onsubmit = guard(async e => {
+    e.preventDefault();
+    await api('/api/attendance', 'PUT', { employee_id: r.employee_id, work_date: date, ...Object.fromEntries(new FormData(e.target)) });
+    closeModal(); toast('Attendance saved.'); renderAttendanceAdmin();
+  });
+}
+
+// ---------- Shifts & schedule ----------
+async function renderShifts() {
+  const [shifts, sched] = await Promise.all([api('/api/shifts'), api('/api/schedule')]);
+  main().innerHTML = `
+    <div class="page-head"><h2>Shifts &amp; Schedule</h2><button class="btn primary" id="new-shift">+ New shift</button></div>
+    <div class="card"><h3>Shifts</h3><div class="table-wrap"><table class="t"><thead><tr><th>Name</th><th>Hours</th><th>Work days</th><th>Grace</th><th>Assigned</th><th></th></tr></thead><tbody>
+    ${shifts.map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.start_time)}&ndash;${esc(s.end_time)}</td><td>${dayNames(s.work_days)}</td><td>${s.grace_minutes} min</td><td>${s.assigned}</td>
+      <td class="actions"><button class="btn small" data-es="${s.id}">Edit</button><button class="btn small bad" data-ds="${s.id}">Delete</button></td></tr>`).join('')}
+    </tbody></table></div></div>
+    <div class="card" style="margin-top:14px"><h3>Employee schedule</h3><div class="table-wrap"><table class="t"><thead><tr><th>Employee</th><th>Department</th><th>Shift</th></tr></thead><tbody>
+    ${sched.map(e => `<tr><td>${esc(e.name)}<div class="muted small">${esc(e.employee_no)}</div></td><td>${esc(e.department || '')}</td>
+      <td><select data-assign="${e.id}">${opts(shifts, e.shift_id, '— none —')}</select></td></tr>`).join('')}
+    </tbody></table></div></div>`;
+  $('#new-shift').onclick = () => shiftModal();
+  main().querySelectorAll('[data-es]').forEach(b => b.onclick = () => shiftModal(shifts.find(s => s.id == b.dataset.es)));
+  main().querySelectorAll('[data-ds]').forEach(b => b.onclick = guard(async () => {
+    if (!confirm('Delete this shift?')) return; await api(`/api/shifts/${b.dataset.ds}`, 'DELETE'); toast('Shift deleted.'); renderShifts();
+  }));
+  main().querySelectorAll('[data-assign]').forEach(sel => sel.onchange = guard(async () => {
+    if (!sel.value) return;
+    await api(`/api/schedule/${sel.dataset.assign}`, 'PUT', { shift_id: sel.value }); toast('Schedule updated.'); renderShifts();
+  }));
+}
+function shiftModal(s) {
+  const days = s ? s.work_days.split(',').map(Number) : [1, 2, 3, 4, 5];
+  openModal(s ? 'Edit shift' : 'New shift', `<form id="sf" class="form-grid">
+    <label class="full">Shift name<input name="name" value="${esc(s?.name)}" required></label>
+    <label>Start time<input type="time" name="start_time" value="${esc(s?.start_time || '08:00')}" required></label>
+    <label>End time<input type="time" name="end_time" value="${esc(s?.end_time || '17:00')}" required></label>
+    <label>Grace period (minutes)<input type="number" name="grace_minutes" min="0" max="120" value="${s ? s.grace_minutes : 10}"></label>
+    <div class="full"><div class="muted small" style="margin-bottom:6px">Work days</div>
+      <div class="actions">${DAYS.map((n, i) => `<label class="check"><input type="checkbox" name="d${i}" ${days.includes(i) ? 'checked' : ''}> ${n}</label>`).join('')}</div></div>
+    <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Save</button></div></form>`);
+  $('#sf').onsubmit = guard(async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = { name: fd.get('name'), start_time: fd.get('start_time'), end_time: fd.get('end_time'), grace_minutes: fd.get('grace_minutes'),
+      work_days: DAYS.map((_, i) => i).filter(i => fd.has('d' + i)) };
+    await api(s ? `/api/shifts/${s.id}` : '/api/shifts', s ? 'PUT' : 'POST', body);
+    closeModal(); toast('Shift saved.'); renderShifts();
+  });
+}
+
+// ---------- Payroll processing updates ----------
+async function renderPayroll() {
+  const rows = await api('/api/payroll');
+  main().innerHTML = `
+    <div class="page-head"><h2>Payroll Updates</h2>${isStaff() ? '<button class="btn primary" id="new-pay">+ Post update</button>' : ''}</div>
+    <p class="muted small">Status notices only. This system does not compute or pay salaries.</p>
+    <div class="card">${rows.map(p => `<div class="ann ${p.status === 'Delayed' ? 'urgent' : ''}">
+      <h3>${esc(p.period_label)} ${badge(p.status)}</h3>
+      <div class="muted small">${p.pay_date ? 'Pay date: ' + fmtDate(p.pay_date) + ' &middot; ' : ''}${fmtDT(p.created_at)} &middot; ${esc(p.author)}</div>
+      ${p.note ? `<p>${esc(p.note)}</p>` : ''}
+      ${isStaff() ? `<button class="btn small" data-delp="${p.id}">Delete</button>` : ''}</div>`).join('') || '<p class="muted">No payroll updates yet.</p>'}</div>`;
+  if (isStaff()) {
+    $('#new-pay').onclick = payModal;
+    main().querySelectorAll('[data-delp]').forEach(b => b.onclick = guard(async () => {
+      if (!confirm('Delete this update?')) return; await api(`/api/payroll/${b.dataset.delp}`, 'DELETE'); renderPayroll();
+    }));
+  }
+}
+function payModal() {
+  openModal('Post payroll update', `<form id="pyf" class="form-grid">
+    <label class="full">Pay period<input name="period_label" placeholder="Nov 1-15, 2026" required></label>
+    <label>Status<select name="status"><option>Processing</option><option>Released</option><option>Delayed</option></select></label>
+    <label>Pay date<input type="date" name="pay_date"></label>
+    <label class="full">Note (optional)<textarea name="note" rows="2"></textarea></label>
+    <label class="check full"><input type="checkbox" name="send_sms" checked> Send as SMS to all employees</label>
+    <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Post</button></div></form>`);
+  $('#pyf').onsubmit = guard(async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target), body = Object.fromEntries(fd); body.send_sms = fd.has('send_sms');
+    const r = await api('/api/payroll', 'POST', body);
+    closeModal(); toast(body.send_sms ? `Posted. SMS: ${r.sms.sent} sent, ${r.sms.failed} failed.` : 'Posted.'); renderPayroll();
+  });
+}
+
+// ---------- Reports (generated by Python) ----------
+let repMonth = ymLocal();
+async function renderReports() {
+  main().innerHTML = `<div class="page-head"><h2>Attendance Report</h2></div>
+    <div class="card"><div class="form-grid" style="align-items:end">
+      <label>Month<input type="month" id="rep-month" value="${repMonth}" placeholder="YYYY-MM"></label>
+      <div class="actions"><button class="btn primary" id="rep-run">Generate</button><a class="btn" id="rep-csv" href="#">Download CSV</a></div></div>
+      <p class="muted small">Generated by a Python script (<code>reports/attendance_report.py</code>) that reads the database and classifies every scheduled work day as present, late, on leave or absent.</p></div>
+    <div id="rep-out" style="margin-top:14px"></div>`;
+  const run = guard(async () => {
+    const m = $('#rep-month').value; if (!/^\d{4}-\d{2}$/.test(m)) throw new Error('Choose a month (YYYY-MM).');
+    repMonth = m; $('#rep-csv').href = `/api/reports/attendance?month=${m}&format=csv`;
+    $('#rep-out').innerHTML = '<p class="muted">Running report…</p>';
+    const r = await api('/api/reports/attendance?month=' + m);
+    const t = r.totals;
+    $('#rep-out').innerHTML = `
+      <div class="grid stats">${[['Employees', t.employees], ['Present days', t.present], ['Late', t.late], ['Absent days', t.absent], ['Avg. attendance', t.average_rate === null ? '—' : t.average_rate + '%']]
+        .map(([l, n]) => `<div class="card stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('')}</div>
+      <div class="card"><p class="muted small">Counted through ${fmtDate(r.through)}.</p><div class="table-wrap"><table class="t"><thead><tr><th>Employee</th><th>Shift</th><th>Sched.</th><th>Present</th><th>Late</th><th>Absent</th><th>Leave</th><th>Late min.</th><th>Hours</th><th>Rate</th></tr></thead><tbody>
+      ${r.rows.map(x => `<tr><td>${esc(x.name)}<div class="muted small">${esc(x.department)}</div></td><td>${esc(x.shift)}</td><td>${x.scheduled_days}</td><td>${x.present}</td><td>${x.late}</td><td>${x.absent}</td><td>${x.on_leave}</td><td>${x.late_minutes}</td><td>${x.hours_worked}</td><td>${x.attendance_rate === null ? '—' : x.attendance_rate + '%'}</td></tr>`).join('')}
+      </tbody></table></div></div>`;
+  });
+  $('#rep-run').onclick = run; $('#rep-csv').href = `/api/reports/attendance?month=${repMonth}&format=csv`; run();
+}
