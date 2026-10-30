@@ -45,6 +45,8 @@ const PAGES = {
   employees: { label: 'Employees', staff: true, render: renderEmployees },
   announcements: { label: 'Announcements', render: renderAnnouncements },
   smslog: { label: 'SMS Log', staff: true, render: renderSmsLog },
+  emaillog: { label: 'Email Log', staff: true, render: renderEmailLog },
+  holidays: { label: 'Holidays', render: renderHolidays },
   audit: { label: 'Audit Log', admin: true, render: renderAudit },
   profile: { label: 'My Profile', render: renderProfile },
 };
@@ -95,9 +97,31 @@ const main = () => $('#main');
 $('#login-form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = new FormData(e.target);
-  try { await api('/api/login', 'POST', { username: f.get('username'), password: f.get('password') }); $('#login-error').textContent = ''; e.target.reset(); boot(); }
-  catch (err) { $('#login-error').textContent = err.message; }
+  try {
+    const r = await api('/api/login', 'POST', { username: f.get('username'), password: f.get('password') });
+    $('#login-error').textContent = '';
+    if (r.otpRequired) return showOtp(r);
+    e.target.reset(); boot();
+  } catch (err) { $('#login-error').textContent = err.message; }
 });
+
+// ---------- SMS code (OTP) step ----------
+function showOtp(r) {
+  $('#login-form').hidden = true; $('#otp-form').hidden = false;
+  $('#otp-info').textContent = `We sent a 6-digit code by SMS to ${r.mobile}. It expires in ${Math.round(r.expiresInSeconds / 60)} minutes.`;
+  $('#otp-dev').innerHTML = r.devCode ? `Sandbox mode: no real SMS is sent, so your code is <b>${esc(r.devCode)}</b>.` : '';
+  $('#otp-error').textContent = ''; const i = $('#otp-form input'); i.value = ''; i.focus();
+}
+function backToLogin() { $('#otp-form').hidden = true; $('#login-form').hidden = false; $('#login-form').reset(); }
+$('#otp-back').onclick = backToLogin;
+$('#otp-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  try { await api('/api/login/verify', 'POST', { code: new FormData(e.target).get('code') }); backToLogin(); boot(); }
+  catch (err) { $('#otp-error').textContent = err.message; }
+});
+$('#otp-resend').onclick = async () => {
+  try { showOtp(await api('/api/login/resend', 'POST')); } catch (err) { $('#otp-error').textContent = err.message; }
+};
 $('#logout').addEventListener('click', async () => { await api('/api/logout', 'POST'); boot(); });
 
 // ---------- Dashboard ----------
@@ -111,7 +135,7 @@ async function renderDashboard() {
   }
   main().innerHTML = `
     <div class="page-head"><h2>Welcome, ${esc(me.name.split(' ')[0])}</h2>
-      <span class="muted small">SMS provider: <b>${esc(lookups.smsProvider)}</b>${lookups.smsProvider === 'sandbox' ? ' (messages are logged, not sent)' : ''}</span></div>
+      <span class="muted small">SMS provider: <b>${esc(lookups.smsProvider)}</b>${lookups.smsProvider === 'sandbox' ? ' (logged, not sent)' : ''} &middot; Email: <b>${esc(lookups.emailProvider)}</b></span></div>
     <div class="grid stats">${stats.map(([l, n]) => `<div class="card stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('')}</div>
     ${pay[0] ? `<div class="card" style="margin-bottom:14px"><h3>Payroll update</h3><b>${esc(pay[0].period_label)}</b> ${badge(pay[0].status)}${pay[0].pay_date ? ' <span class="muted small">Pay date ' + fmtDate(pay[0].pay_date) + '</span>' : ''}${pay[0].note ? '<p>' + esc(pay[0].note) + '</p>' : ''}</div>` : ''}
     <div class="card"><h3>Latest announcements</h3>${annList(ann.slice(0, 3), false) || '<p class="muted">Nothing posted yet.</p>'}</div>`;
@@ -147,7 +171,7 @@ function leaveTable(rows, review) {
         ? (r.employee_id === me.employeeId
           ? '<span class="muted small">Your own request &ndash; another reviewer must decide</span>'
           : `<button class="btn small ok" data-review="${r.id}" data-d="Approved">Approve</button><button class="btn small bad" data-review="${r.id}" data-d="Rejected">Reject</button>`)
-        : `<button class="btn small" data-cancel="${r.id}">Cancel</button>`) : ''}</td></tr>`).join('')}
+        : `<button class="btn small" data-cancel="${r.id}">Cancel</button>`) : ''}<a class="btn small" href="/api/leave/${r.id}/pdf" target="_blank" rel="noopener">PDF</a></td></tr>`).join('')}
     </tbody></table></div>`;
 }
 function fileLeaveModal() {
@@ -179,18 +203,19 @@ function reviewModal(id, decision) {
   openModal(`${decision === 'Approved' ? 'Approve' : 'Reject'} request`, `<form id="rf">
     <label>Remarks (included in the SMS, optional)<textarea name="remarks" rows="3"></textarea></label>
     <div class="form-actions"><button type="button" class="btn" onclick="closeModal()">Cancel</button>
-    <button class="btn ${decision === 'Approved' ? 'ok' : 'bad'}">${decision === 'Approved' ? 'Approve' : 'Reject'} &amp; notify by SMS</button></div></form>`);
+    <button class="btn ${decision === 'Approved' ? 'ok' : 'bad'}">${decision === 'Approved' ? 'Approve' : 'Reject'} &amp; notify</button></div></form>`);
   $('#rf').onsubmit = guard(async e => {
     e.preventDefault();
     const r = await api(`/api/leave/${id}/review`, 'POST', { decision, remarks: new FormData(e.target).get('remarks') });
-    closeModal(); toast(r.sms?.ok ? 'Decision saved and SMS dispatched.' : `Decision saved. SMS not sent: ${r.sms?.error || 'n/a'}`, !r.sms?.ok); renderApprovals();
+    const ch = [r.sms?.ok && 'SMS', r.email?.ok && 'email'].filter(Boolean);
+    closeModal(); toast(ch.length ? `Decision saved. Employee notified by ${ch.join(' and ')}.` : `Decision saved. No notification sent (${r.sms?.error || r.email?.error || 'n/a'}).`, !ch.length); renderApprovals();
   });
 }
 
 // ---------- Employees (staff) ----------
 async function renderEmployees() {
   const rows = await api('/api/employees');
-  main().innerHTML = `<div class="page-head"><h2>Employees</h2><button class="btn primary" id="add-emp">+ Add employee</button></div>
+  main().innerHTML = `<div class="page-head"><h2>Employees</h2><div class="actions"><a class="btn" href="/api/employees/export.xlsx">Export Excel</a><button class="btn primary" id="add-emp">+ Add employee</button></div></div>
     <div class="card"><div class="table-wrap"><table class="t"><thead><tr><th>No.</th><th>Name</th><th>Department</th><th>Position</th><th>Mobile</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>
     ${rows.map(e => `<tr><td>${esc(e.employee_no)}</td><td>${esc(e.first_name)} ${esc(e.last_name)}<div class="muted small">${esc(e.email || '')}</div></td>
       <td>${esc(e.department || '')}</td><td>${esc(e.position || '')}</td><td>${esc(e.mobile || '')}</td><td>${esc(e.role)}</td>
@@ -255,15 +280,15 @@ function annModal() {
     <label class="full">Title<input name="title" required></label>
     <label class="full">Message<textarea name="body" rows="4" required></textarea></label>
     <label>Audience<select name="department_id">${opts(lookups.departments, '', 'Company-wide')}</select></label>
-    <div class="full"><label class="check"><input type="checkbox" name="send_sms"> Also send as SMS</label>
-    <label class="check"><input type="checkbox" name="is_urgent"> Mark as urgent (always sends SMS)</label></div>
+    <div class="full"><label class="check"><input type="checkbox" name="send_sms"> Also send by SMS and email</label>
+    <label class="check"><input type="checkbox" name="is_urgent"> Mark as urgent (always sends SMS and email)</label></div>
     <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Publish</button></div></form>`);
   $('#af').onsubmit = guard(async e => {
     e.preventDefault();
     const fd = new FormData(e.target), body = Object.fromEntries(fd);
     body.send_sms = fd.has('send_sms'); body.is_urgent = fd.has('is_urgent');
     const r = await api('/api/announcements', 'POST', body);
-    closeModal(); toast(r.sms.sent || r.sms.failed ? `Published. SMS: ${r.sms.sent} sent, ${r.sms.failed} failed.` : 'Published.'); renderAnnouncements();
+    closeModal(); toast(r.sms.sent || r.sms.failed || r.email.sent || r.email.failed ? `Published. SMS: ${r.sms.sent} sent, ${r.sms.failed} failed. Email: ${r.email.sent} sent, ${r.email.failed} failed.` : 'Published.'); renderAnnouncements();
   });
 }
 
@@ -307,15 +332,22 @@ async function renderProfile() {
         <label>Email<input name="email" type="email" value="${esc(p.email)}"></label>
         <label>Mobile number (for SMS alerts)<input name="mobile" value="${esc(p.mobile)}" placeholder="09171234567"></label>
         <label class="check"><input type="checkbox" name="sms_opt_in" ${p.sms_opt_in ? 'checked' : ''}> Receive SMS notifications</label>
+        <label class="check"><input type="checkbox" name="email_opt_in" ${p.email_opt_in ? 'checked' : ''}> Receive email notifications</label>
         <div><button class="btn primary">Save contact details</button></div>
       </form></div>
     <div class="card"><h3>Change password</h3><form id="pw" class="grid">
       <label>Current password<input type="password" name="current" required></label>
       <label>New password (min. 6)<input type="password" name="next" minlength="6" required></label>
       <div><button class="btn">Update password</button></div></form></div>
+    <div class="card"><h3>Login security</h3>${otpCard(p)}</div>
   </div>`;
+  const tg = $('#otp-toggle');
+  if (tg) tg.onchange = async () => {
+    try { await api('/api/profile/otp', 'PUT', { enabled: tg.checked }); toast(tg.checked ? 'SMS code at login is ON.' : 'SMS code at login is OFF.'); }
+    catch (err) { tg.checked = !tg.checked; toast(err.message, true); }
+  };
   $('#pf').onsubmit = guard(async e => {
-    e.preventDefault(); const fd = new FormData(e.target), b = Object.fromEntries(fd); b.sms_opt_in = fd.has('sms_opt_in');
+    e.preventDefault(); const fd = new FormData(e.target), b = Object.fromEntries(fd); b.sms_opt_in = fd.has('sms_opt_in'); b.email_opt_in = fd.has('email_opt_in');
     await api('/api/profile', 'PUT', b); toast('Profile updated.');
   });
   $('#pw').onsubmit = guard(async e => {
@@ -377,6 +409,7 @@ async function renderMyAttendance() {
       <div id="clock" class="clock"></div>
       <div class="muted">${new Date().toLocaleDateString('en-PH', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</div>
       <p>${t.shift ? `Shift: <b>${esc(t.shift.name)}</b> ${esc(t.shift.start_time)}&ndash;${esc(t.shift.end_time)} &middot; ${dayNames(t.shift.work_days)}` : '<span class="muted">No shift assigned yet.</span>'}</p>
+      ${t.holiday ? `<p><span class="badge b-Holiday">Holiday: ${esc(t.holiday)}</span> <span class="muted small">Clocking in is still allowed (holiday work).</span></p>` : ''}
       <p>${msg}</p>
       <div class="actions" style="justify-content:center">
         <button class="btn ok" id="clock-in" ${canIn ? '' : 'disabled'}>Clock in</button>
@@ -404,7 +437,7 @@ async function renderAttendanceAdmin() {
   const d = await api('/api/attendance?date=' + attDate);
   const count = (s) => d.rows.filter(r => r.status === s).length;
   main().innerHTML = `
-    <div class="page-head"><h2>Attendance</h2><input type="date" id="att-date" value="${d.date}" style="max-width:190px"></div>
+    <div class="page-head"><h2>Attendance${d.holiday ? ` <span class="badge b-Holiday">${esc(d.holiday)}</span>` : ''}</h2><input type="date" id="att-date" value="${d.date}" style="max-width:190px"></div>
     <div class="grid stats">
       ${[['Present', count('Present')], ['Late', count('Late')], ['On leave', count('On Leave')], ['Absent', count('Absent')]]
         .map(([l, n]) => `<div class="card stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('')}
@@ -500,13 +533,13 @@ function payModal() {
     <label>Status<select name="status"><option>Processing</option><option>Released</option><option>Delayed</option></select></label>
     <label>Pay date<input type="date" name="pay_date"></label>
     <label class="full">Note (optional)<textarea name="note" rows="2"></textarea></label>
-    <label class="check full"><input type="checkbox" name="send_sms" checked> Send as SMS to all employees</label>
+    <label class="check full"><input type="checkbox" name="send_sms" checked> Send by SMS and email to all employees</label>
     <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Post</button></div></form>`);
   $('#pyf').onsubmit = guard(async e => {
     e.preventDefault();
     const fd = new FormData(e.target), body = Object.fromEntries(fd); body.send_sms = fd.has('send_sms');
     const r = await api('/api/payroll', 'POST', body);
-    closeModal(); toast(body.send_sms ? `Posted. SMS: ${r.sms.sent} sent, ${r.sms.failed} failed.` : 'Posted.'); renderPayroll();
+    closeModal(); toast(body.send_sms ? `Posted. SMS: ${r.sms.sent} sent, ${r.sms.failed} failed. Email: ${r.email.sent} sent, ${r.email.failed} failed.` : 'Posted.'); renderPayroll();
   });
 }
 
@@ -516,12 +549,12 @@ async function renderReports() {
   main().innerHTML = `<div class="page-head"><h2>Attendance Report</h2></div>
     <div class="card"><div class="form-grid" style="align-items:end">
       <label>Month<input type="month" id="rep-month" value="${repMonth}" placeholder="YYYY-MM"></label>
-      <div class="actions"><button class="btn primary" id="rep-run">Generate</button><a class="btn" id="rep-csv" href="#">Download CSV</a></div></div>
-      <p class="muted small">Generated by a Python script (<code>reports/attendance_report.py</code>) that reads the database and classifies every scheduled work day as present, late, on leave or absent.</p></div>
+      <div class="actions"><button class="btn primary" id="rep-run">Generate</button><a class="btn" id="rep-xlsx" href="#">Excel</a><a class="btn" id="rep-pdf" href="#">PDF</a><a class="btn" id="rep-csv" href="#">CSV</a></div></div>
+      <p class="muted small">Calculated by Python (<code>reports/attendance_report.py</code>); the Excel and PDF files are built by <code>reports/export_report.py</code> (openpyxl and reportlab). Holidays are not counted as scheduled days.</p></div>
     <div id="rep-out" style="margin-top:14px"></div>`;
   const run = guard(async () => {
     const m = $('#rep-month').value; if (!/^\d{4}-\d{2}$/.test(m)) throw new Error('Choose a month (YYYY-MM).');
-    repMonth = m; $('#rep-csv').href = `/api/reports/attendance?month=${m}&format=csv`;
+    repMonth = m; repLinks(m);
     $('#rep-out').innerHTML = '<p class="muted">Running report…</p>';
     const r = await api('/api/reports/attendance?month=' + m);
     const t = r.totals;
@@ -532,5 +565,66 @@ async function renderReports() {
       ${r.rows.map(x => `<tr><td>${esc(x.name)}<div class="muted small">${esc(x.department)}</div></td><td>${esc(x.shift)}</td><td>${x.scheduled_days}</td><td>${x.present}</td><td>${x.late}</td><td>${x.absent}</td><td>${x.on_leave}</td><td>${x.late_minutes}</td><td>${x.hours_worked}</td><td>${x.attendance_rate === null ? '—' : x.attendance_rate + '%'}</td></tr>`).join('')}
       </tbody></table></div></div>`;
   });
-  $('#rep-run').onclick = run; $('#rep-csv').href = `/api/reports/attendance?month=${repMonth}&format=csv`; run();
+  $('#rep-run').onclick = run; repLinks(repMonth); run();
+}
+
+function otpCard(p) {
+  const m = lookups.otpMode;
+  if (m === 'all') return '<p>An SMS code is required at login for <b>all accounts</b> (set by the administrator).</p>';
+  if (m === 'staff' && (me.role === 'Admin' || me.role === 'HR Staff')) return '<p>An SMS code is required at login for <b>Admin and HR Staff</b> accounts.</p>';
+  if (m === 'off') return '<p class="muted">SMS login codes are turned off by the administrator.</p>';
+  return `<label class="check"><input type="checkbox" id="otp-toggle" ${p.otp_enabled ? 'checked' : ''}> Ask for an SMS code when I log in</label>
+    <p class="muted small">A 6-digit code is texted to your mobile number each time you sign in. Save a valid mobile number above first.</p>`;
+}
+
+const repLinks = (m) => ['csv', 'xlsx', 'pdf'].forEach(f => { $('#rep-' + f).href = `/api/reports/attendance?month=${m}&format=${f}`; });
+
+// ---------- Holidays (external API) ----------
+let holYear = new Date().getFullYear();
+async function renderHolidays() {
+  const d = await api('/api/holidays?year=' + holYear);
+  const src = { api: 'Holiday API', fallback: 'Built-in list', manual: 'Company' };
+  main().innerHTML = `
+    <div class="page-head"><h2>Holidays</h2><div class="actions">
+      <input type="number" id="hol-year" value="${d.year}" min="2000" max="2100" style="width:110px">
+      ${isStaff() ? '<button class="btn" id="hol-sync">Sync from API</button><button class="btn primary" id="hol-add">+ Add holiday</button>' : ''}</div></div>
+    <p class="muted small">Public holidays are loaded from the Nager.Date web API (country ${esc(d.country)}). Weekends and holidays are not counted as leave days and are not marked absent.</p>
+    <div class="card">${d.rows.length ? `<div class="table-wrap"><table class="t"><thead><tr><th>Date</th><th>Day</th><th>Holiday</th><th>Source</th><th></th></tr></thead><tbody>
+      ${d.rows.map(h => `<tr><td>${fmtDate(h.date)}</td><td>${new Date(h.date + 'T00:00:00').toLocaleDateString('en-PH', { weekday: 'long' })}</td><td>${esc(h.name)}</td><td>${src[h.source] || esc(h.source)}</td>
+        <td class="actions">${isStaff() ? `<button class="btn small bad" data-delh="${h.id}">Delete</button>` : ''}</td></tr>`).join('')}
+      </tbody></table></div>` : '<p class="muted">No holidays for this year yet.</p>'}</div>`;
+  $('#hol-year').onchange = (e) => { const y = +e.target.value; if (y >= 2000 && y <= 2100) { holYear = y; guard(renderHolidays)(); } };
+  if (!isStaff()) return;
+  $('#hol-sync').onclick = guard(async () => {
+    const r = await api('/api/holidays/sync', 'POST', { year: holYear });
+    toast(r.warning || `Synced ${r.count} holidays from the API.`, !!r.warning); renderHolidays();
+  });
+  $('#hol-add').onclick = () => {
+    openModal('Add company holiday', `<form id="hf" class="form-grid">
+      <label>Date<input type="date" name="date" required></label><label>Name<input name="name" required></label>
+      <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Save</button></div></form>`);
+    $('#hf').onsubmit = guard(async e => { e.preventDefault(); await api('/api/holidays', 'POST', Object.fromEntries(new FormData(e.target))); closeModal(); toast('Holiday saved.'); renderHolidays(); });
+  };
+  main().querySelectorAll('[data-delh]').forEach(b => b.onclick = guard(async () => {
+    if (!confirm('Delete this holiday?')) return; await api(`/api/holidays/${b.dataset.delh}`, 'DELETE'); renderHolidays();
+  }));
+}
+
+// ---------- Email log ----------
+async function renderEmailLog() {
+  const rows = await api('/api/email-log');
+  main().innerHTML = `<div class="page-head"><h2>Email Log</h2>${me.role === 'Admin' ? '<button class="btn" id="mail-test">Send test email</button>' : ''}</div>
+    <div class="card"><div class="table-wrap"><table class="t"><thead><tr><th>When</th><th>To</th><th>Subject</th><th>Trigger</th><th>Provider</th><th>Status</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${fmtDT(r.created_at)}</td><td>${esc(r.employee_name || '')}<div class="muted small">${esc(r.recipient)}</div></td>
+      <td>${esc(r.subject)}${r.status === 'failed' ? `<div class="small" style="color:var(--bad)">${esc(r.response)}</div>` : ''}</td>
+      <td>${esc(r.trigger_type)}</td><td>${esc(r.provider)}</td><td>${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No emails yet.</td></tr>'}
+    </tbody></table></div></div>`;
+  if (me.role === 'Admin') $('#mail-test').onclick = () => {
+    openModal('Send test email', `<form id="mf" class="form-grid"><label class="full">To<input name="to" type="email" required></label>
+      <div class="form-actions full"><button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary">Send</button></div></form>`);
+    $('#mf').onsubmit = guard(async e => {
+      e.preventDefault(); const r = await api('/api/email-test', 'POST', Object.fromEntries(new FormData(e.target)));
+      closeModal(); toast(r.ok ? 'Test email processed.' : `Failed: ${r.error}`, !r.ok); renderEmailLog();
+    });
+  };
 }

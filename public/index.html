@@ -31,6 +31,16 @@
       </table>
     </details>
   </form>
+
+  <form id="otp-form" class="card login-card" hidden>
+    <h1>Verify</h1>
+    <p class="muted" id="otp-info"></p>
+    <p id="otp-dev" class="small"></p>
+    <label>6-digit code <input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+    <p id="otp-error" class="error"></p>
+    <button class="btn primary" type="submit">Verify and sign in</button>
+    <div class="actions"><button type="button" class="btn small" id="otp-resend">Resend code</button><button type="button" class="btn small" id="otp-back">Back</button></div>
+  </form>
 </div>
 
 <!-- App -->

@@ -46,26 +46,27 @@ const logStmt = db.prepare(`INSERT INTO sms_log
 /**
  * Send an SMS and record it in sms_log. Never throws – failures are logged.
  */
-async function sendSMS({ employeeId = null, mobile, message, trigger = 'test' }) {
+async function sendSMS({ employeeId = null, mobile, message, trigger = 'test', logMessage }) {
+  const shown = logMessage || message; // what gets stored in sms_log (OTP codes are hidden)
   const to = normalizeNumber(mobile, PROVIDER);
   if (!to) {
-    logStmt.run(employeeId, String(mobile || ''), message, PROVIDER, 'failed', 'Invalid mobile number', trigger);
+    logStmt.run(employeeId, String(mobile || ''), shown, PROVIDER, 'failed', 'Invalid mobile number', trigger);
     return { ok: false, error: 'Invalid mobile number' };
   }
   try {
     if (PROVIDER === 'semaphore') {
       const r = await sendViaSemaphore(to, message);
-      logStmt.run(employeeId, to, message, 'semaphore', 'sent', r.slice(0, 500), trigger);
+      logStmt.run(employeeId, to, shown, 'semaphore', 'sent', r.slice(0, 500), trigger);
     } else if (PROVIDER === 'twilio') {
       const r = await sendViaTwilio(to, message);
-      logStmt.run(employeeId, to, message, 'twilio', 'sent', r.slice(0, 500), trigger);
+      logStmt.run(employeeId, to, shown, 'twilio', 'sent', r.slice(0, 500), trigger);
     } else {
-      logStmt.run(employeeId, to, message, 'sandbox', 'sandbox', 'Sandbox mode: message not actually sent', trigger);
+      logStmt.run(employeeId, to, shown, 'sandbox', 'sandbox', 'Sandbox mode: message not actually sent', trigger);
       console.log(`[SMS sandbox] -> ${to}: ${message}`);
     }
     return { ok: true };
   } catch (err) {
-    logStmt.run(employeeId, to, message, PROVIDER, 'failed', String(err.message).slice(0, 500), trigger);
+    logStmt.run(employeeId, to, shown, PROVIDER, 'failed', String(err.message).slice(0, 500), trigger);
     console.error('[SMS error]', err.message);
     return { ok: false, error: err.message };
   }

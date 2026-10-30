@@ -218,3 +218,6 @@ table.t th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; 
 
 .cv { display: block; }
 @media (max-width: 760px) { table.t td .cv { text-align: right; min-width: 0; } }
+
+.b-Holiday { background: #ede3ff; color: #5b2fa8; }
+@media (prefers-color-scheme: dark) { .b-Holiday { background: #33224f; color: #cdb4ff; } }

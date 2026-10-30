@@ -5,6 +5,10 @@ const bcrypt = require('bcryptjs');
 const path = require('path');
 const db = require('./db');
 const sms = require('./sms');
+const email = require('./email');
+const notifier = require('./notify');
+const holidays = require('./holidays');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -39,29 +43,110 @@ function fail(res, e) {
 }
 
 function businessDays(start, end) {
-  // inclusive count of weekdays
-  let d = new Date(start), e = new Date(end), n = 0;
-  while (d <= e) { const w = d.getDay(); if (w !== 0 && w !== 6) n++; d.setDate(d.getDate() + 1); }
+  // inclusive count of working days: weekends and public/company holidays are skipped
+  const hol = new Set(db.prepare('SELECT date FROM holidays WHERE date BETWEEN ? AND ?').all(start, end).map(r => r.date));
+  const d = new Date(start + 'T00:00:00'), e = new Date(end + 'T00:00:00');
+  let n = 0;
+  while (d <= e) { const w = d.getDay(); if (w !== 0 && w !== 6 && !hol.has(localDate(d))) n++; d.setDate(d.getDate() + 1); }
   return n;
 }
 
+// Send one message to many employees by SMS and email (sequential, to respect free-tier rate limits).
+// People without a number/address or who opted out are skipped, not counted as failures.
+async function broadcast(targets, subject, text, trigger) {
+  const tally = { sms: { sent: 0, failed: 0 }, email: { sent: 0, failed: 0 } };
+  const count = (bucket, r) => { if (r.ok) bucket.sent++; else if (!/opted out/.test(r.error || '')) bucket.failed++; };
+  for (const t of targets) {
+    const out = await notifier.notify(t.id, { subject, message: text, trigger });
+    count(tally.sms, out.sms); count(tally.email, out.email);
+  }
+  return tally;
+}
+
 const EMP_SELECT = `
-  SELECT e.*, u.username, u.is_active, r.name AS role, d.name AS department
+  SELECT e.*, u.username, u.is_active, u.otp_enabled, r.name AS role, d.name AS department
   FROM employees e
   JOIN users u ON u.id = e.user_id
   JOIN roles r ON r.id = u.role_id
   LEFT JOIN departments d ON d.id = e.department_id`;
 
 // ---------- Auth ----------
-app.post('/api/login', wrap((req, res) => {
+// Login: password first, then (when required) a 6-digit code sent by SMS.
+const OTP_MODE = (process.env.OTP_MODE || 'optional').toLowerCase(); // off | optional (user opts in) | staff (Admin + HR always) | all
+const OTP_TTL_MS = 5 * 60 * 1000, OTP_MAX_TRIES = 5, OTP_RESEND_MS = 30 * 1000;
+const hashCode = (c) => crypto.createHash('sha256').update(String(c) + (process.env.SESSION_SECRET || 'dev-secret')).digest('hex');
+const maskMobile = (m) => { const n = sms.normalizeNumber(m, 'semaphore') || ''; return n.length > 5 ? n.slice(0, 2) + '*'.repeat(n.length - 5) + n.slice(-3) : '****'; };
+const otpRequired = (u) => OTP_MODE === 'off' ? false : OTP_MODE === 'all' ? true
+  : (OTP_MODE === 'staff' && (u.role === 'Admin' || u.role === 'HR Staff')) || !!u.otp_enabled;
+const userById = (id) => db.prepare('SELECT u.*, r.name AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?').get(id);
+
+function finishLogin(req, u) {
+  const emp = db.prepare('SELECT id, first_name, last_name FROM employees WHERE user_id = ?').get(u.id);
+  req.session.user = { id: u.id, username: u.username, role: u.role, employeeId: emp?.id, name: emp ? `${emp.first_name} ${emp.last_name}` : u.username };
+  audit(u.id, 'login');
+  return req.session.user;
+}
+
+async function sendOtp(req, res, u) {
+  const emp = db.prepare('SELECT id, mobile FROM employees WHERE user_id = ?').get(u.id);
+  if (!emp || !sms.normalizeNumber(emp.mobile, sms.PROVIDER)) {
+    delete req.session.pending;
+    return res.status(400).json({ error: 'An SMS code is required but your account has no valid mobile number. Ask HR or an administrator to add one.' });
+  }
+  const code = String(crypto.randomInt(100000, 1000000));
+  req.session.pending = { userId: u.id, hash: hashCode(code), expires: Date.now() + OTP_TTL_MS, tries: 0, sentAt: Date.now() };
+  const out = await sms.sendSMS({ employeeId: emp.id, mobile: emp.mobile, trigger: 'otp',
+    message: `HRIS login code: ${code}. Valid for 5 minutes. Never share this code.`, logMessage: 'HRIS login code: ****** (hidden)' });
+  if (!out.ok) { delete req.session.pending; return res.status(502).json({ error: `Could not send the SMS code: ${out.error}` }); }
+  audit(u.id, 'otp_sent');
+  // In sandbox mode no real SMS exists, so the code is returned for demos. Never done with a real provider.
+  res.json({ otpRequired: true, mobile: maskMobile(emp.mobile), expiresInSeconds: OTP_TTL_MS / 1000, ...(sms.PROVIDER === 'sandbox' ? { devCode: code } : {}) });
+}
+
+app.post('/api/login', wrap(async (req, res) => {
   const { username, password } = req.body;
   const u = db.prepare(`SELECT u.*, r.name AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE username = ?`).get(username || '');
   if (!u || !u.is_active || !bcrypt.compareSync(password || '', u.password_hash))
     return res.status(401).json({ error: 'Invalid username or password.' });
-  const emp = db.prepare('SELECT id, first_name, last_name FROM employees WHERE user_id = ?').get(u.id);
-  req.session.user = { id: u.id, username: u.username, role: u.role, employeeId: emp?.id, name: emp ? `${emp.first_name} ${emp.last_name}` : u.username };
-  audit(u.id, 'login');
-  res.json(req.session.user);
+  delete req.session.user;
+  if (otpRequired(u)) return sendOtp(req, res, u);
+  res.json(finishLogin(req, u));
+}));
+
+app.post('/api/login/verify', wrap((req, res) => {
+  const p = req.session.pending;
+  if (!p) return res.status(400).json({ error: 'No login in progress. Please sign in again.' });
+  if (Date.now() > p.expires) { delete req.session.pending; return res.status(401).json({ error: 'The code expired. Please sign in again.' }); }
+  if (p.tries >= OTP_MAX_TRIES) { delete req.session.pending; return res.status(429).json({ error: 'Too many wrong codes. Please sign in again.' }); }
+  p.tries++;
+  const ok = crypto.timingSafeEqual(Buffer.from(hashCode(String(req.body.code || '').trim())), Buffer.from(p.hash));
+  if (!ok) return res.status(401).json({ error: `Wrong code. ${OTP_MAX_TRIES - p.tries} attempt(s) left.` });
+  const u = userById(p.userId);
+  if (!u || !u.is_active) { delete req.session.pending; return res.status(401).json({ error: 'Account is not active.' }); }
+  delete req.session.pending;
+  res.json(finishLogin(req, u));
+}));
+
+app.post('/api/login/resend', wrap(async (req, res) => {
+  const p = req.session.pending;
+  if (!p) return res.status(400).json({ error: 'No login in progress. Please sign in again.' });
+  const wait = Math.ceil((OTP_RESEND_MS - (Date.now() - p.sentAt)) / 1000);
+  if (wait > 0) return res.status(429).json({ error: `Please wait ${wait} second(s) before requesting another code.` });
+  const u = userById(p.userId);
+  if (!u) return res.status(400).json({ error: 'Please sign in again.' });
+  return sendOtp(req, res, u);
+}));
+
+// Employee turns "SMS code at login" on/off for their own account (in 'optional' mode)
+app.put('/api/profile/otp', requireAuth, wrap((req, res) => {
+  const enable = !!req.body.enabled;
+  if (enable) {
+    const e = db.prepare('SELECT mobile FROM employees WHERE id = ?').get(req.session.user.employeeId);
+    if (!e || !sms.normalizeNumber(e.mobile, sms.PROVIDER)) return res.status(400).json({ error: 'Add a valid mobile number to your profile first.' });
+  }
+  db.prepare('UPDATE users SET otp_enabled = ? WHERE id = ?').run(enable ? 1 : 0, req.session.user.id);
+  audit(req.session.user.id, enable ? 'otp_enabled' : 'otp_disabled');
+  res.json({ ok: true });
 }));
 app.post('/api/logout', (req, res) => { req.session.destroy(() => res.json({ ok: true })); });
 app.get('/api/me', (req, res) => res.json(req.session.user || null));
@@ -83,6 +168,8 @@ app.get('/api/lookups', requireAuth, (req, res) => {
     departments: db.prepare('SELECT * FROM departments ORDER BY name').all(),
     leaveTypes: db.prepare('SELECT * FROM leave_types ORDER BY name').all(),
     smsProvider: sms.PROVIDER,
+    emailProvider: email.PROVIDER,
+    otpMode: OTP_MODE,
   });
 });
 
@@ -98,9 +185,11 @@ app.get('/api/profile', requireAuth, (req, res) => {
 
 // Employees may edit only their own contact info
 app.put('/api/profile', requireAuth, wrap((req, res) => {
-  const { email, mobile, sms_opt_in } = req.body;
-  db.prepare('UPDATE employees SET email = ?, mobile = ?, sms_opt_in = ? WHERE id = ?')
-    .run(email || null, mobile || null, sms_opt_in ? 1 : 0, req.session.user.employeeId);
+  const { email: mail, mobile, sms_opt_in, email_opt_in } = req.body;
+  if (db.prepare('SELECT otp_enabled FROM users WHERE id = ?').get(req.session.user.id).otp_enabled && !sms.normalizeNumber(mobile, sms.PROVIDER))
+    return res.status(400).json({ error: 'A valid mobile number is needed for SMS login codes. Turn off "SMS code at login" first.' });
+  db.prepare('UPDATE employees SET email = ?, mobile = ?, sms_opt_in = ?, email_opt_in = ? WHERE id = ?')
+    .run(mail || null, mobile || null, sms_opt_in ? 1 : 0, email_opt_in === undefined ? 1 : (email_opt_in ? 1 : 0), req.session.user.employeeId);
   audit(req.session.user.id, 'update_profile');
   res.json({ ok: true });
 }));
@@ -197,7 +286,7 @@ app.post('/api/leave', requireAuth, wrap((req, res) => {
   if (end_date < start_date) return res.status(400).json({ error: 'End date cannot be before start date.' });
   const empId = req.session.user.employeeId;
   const days = businessDays(start_date, end_date);
-  if (days < 1) return res.status(400).json({ error: 'Selected dates contain no working days.' });
+  if (days < 1) return res.status(400).json({ error: 'Selected dates contain no working days (weekends and holidays are not counted).' });
 
   // overlap check against Pending/Approved requests (prevents scheduling clashes)
   const clash = db.prepare(`SELECT id FROM leave_requests WHERE employee_id = ? AND status IN ('Pending','Approved')
@@ -237,8 +326,8 @@ app.post('/api/leave/:id/review', requireAuth, requireRole('Admin', 'HR Staff'),
 
   const msg = `HRIS: Your ${lr.leave_type} (${lr.start_date} to ${lr.end_date}) has been ${decision.toUpperCase()}.` +
     (remarks ? ` Remarks: ${remarks}` : '');
-  const smsResult = await sms.notifyEmployee(lr.employee_id, msg, 'leave_status');
-  res.json({ ok: true, sms: smsResult });
+  const out = await notifier.notify(lr.employee_id, { subject: `Your leave request was ${decision.toLowerCase()}`, message: msg, trigger: 'leave_status' });
+  res.json({ ok: true, sms: out.sms, email: out.email });
 }));
 
 // ---------- Announcements ----------
@@ -262,18 +351,14 @@ app.post('/api/announcements', requireAuth, requireRole('Admin', 'HR Staff'), wr
     .run(title, body, is_urgent ? 1 : 0, deptId, req.session.user.id);
   audit(req.session.user.id, 'create_announcement', `announcement ${r.lastInsertRowid}`);
 
-  let sent = 0, failed = 0;
+  let result = { sms: { sent: 0, failed: 0 }, email: { sent: 0, failed: 0 } };
   if (send_sms || is_urgent) {
     const targets = db.prepare(`SELECT e.id FROM employees e JOIN users u ON u.id = e.user_id
-      WHERE u.is_active = 1 AND e.sms_opt_in = 1 AND e.mobile IS NOT NULL AND (? IS NULL OR e.department_id = ?)`).all(deptId, deptId);
+      WHERE u.is_active = 1 AND (? IS NULL OR e.department_id = ?)`).all(deptId, deptId);
     const text = `${is_urgent ? 'URGENT ' : ''}HRIS Announcement: ${title} - ${body}`.slice(0, 450);
-    // sequential to respect free-tier rate limits
-    for (const t of targets) {
-      const out = await sms.notifyEmployee(t.id, text, 'announcement');
-      out.ok ? sent++ : failed++;
-    }
+    result = await broadcast(targets, `${is_urgent ? 'URGENT: ' : ''}${title}`, text, 'announcement');
   }
-  res.json({ id: r.lastInsertRowid, sms: { sent, failed } });
+  res.json({ id: r.lastInsertRowid, ...result });
 }));
 
 app.delete('/api/announcements/:id', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
@@ -362,7 +447,7 @@ app.get('/api/attendance/today', requireAuth, (req, res) => {
   const id = req.session.user.employeeId, today = localDate();
   const rec = db.prepare('SELECT * FROM attendance WHERE employee_id = ? AND work_date = ?').get(id, today);
   const open = db.prepare('SELECT * FROM attendance WHERE employee_id = ? AND time_out IS NULL AND time_in IS NOT NULL ORDER BY work_date DESC LIMIT 1').get(id);
-  res.json({ today, now: localTime(), record: rec || null, open: open || null, shift: shiftFor(id) || null, onLeave: onApprovedLeave(id, today) });
+  res.json({ today, now: localTime(), record: rec || null, open: open || null, shift: shiftFor(id) || null, onLeave: onApprovedLeave(id, today), holiday: db.prepare('SELECT name FROM holidays WHERE date = ?').get(today)?.name || null });
 });
 
 app.post('/api/attendance/clock-in', requireAuth, wrap((req, res) => {
@@ -395,6 +480,7 @@ app.get('/api/attendance/mine', requireAuth, (req, res) => {
 app.get('/api/attendance', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
   const date = validDate(req.query.date) ? req.query.date : localDate();
   const dow = new Date(date + 'T00:00:00').getDay();
+  const hol = db.prepare('SELECT name FROM holidays WHERE date = ?').get(date);
   const rows = db.prepare(`
     SELECT e.id AS employee_id, e.employee_no, e.first_name || ' ' || e.last_name AS name, d.name AS department,
            s.name AS shift, s.start_time, s.end_time, s.work_days, a.time_in, a.time_out, a.status AS att_status, a.remarks
@@ -404,11 +490,12 @@ app.get('/api/attendance', requireAuth, requireRole('Admin', 'HR Staff'), (req, 
     LEFT JOIN attendance a ON a.employee_id = e.id AND a.work_date = ?
     ORDER BY e.last_name, e.first_name`).all(date);
   const today = localDate();
-  res.json({ date, rows: rows.map(r => {
+  res.json({ date, holiday: hol?.name || null, rows: rows.map(r => {
     const workDays = (r.work_days || '1,2,3,4,5').split(',').map(Number);
     let status;
     if (r.time_in) status = r.att_status;
     else if (onApprovedLeave(r.employee_id, date)) status = 'On Leave';
+    else if (hol) status = 'Holiday';
     else if (!workDays.includes(dow)) status = 'Day off';
     else status = date > today ? 'Scheduled' : date === today ? 'Not yet in' : 'Absent';
     return { ...r, status };
@@ -439,40 +526,99 @@ app.post('/api/payroll', requireAuth, requireRole('Admin', 'HR Staff'), wrap(asy
   const r = db.prepare('INSERT INTO payroll_updates (period_label, pay_date, status, note, created_by) VALUES (?,?,?,?,?)')
     .run(period_label.trim(), pay_date || null, status, note || null, req.session.user.id);
   audit(req.session.user.id, 'payroll_update', `${period_label} -> ${status}`);
-  let sent = 0, failed = 0;
+  let result = { sms: { sent: 0, failed: 0 }, email: { sent: 0, failed: 0 } };
   if (send_sms) {
-    const targets = db.prepare(`SELECT e.id FROM employees e JOIN users u ON u.id = e.user_id WHERE u.is_active = 1 AND e.sms_opt_in = 1 AND e.mobile IS NOT NULL`).all();
+    const targets = db.prepare(`SELECT e.id FROM employees e JOIN users u ON u.id = e.user_id WHERE u.is_active = 1`).all();
     const text = `HRIS Payroll: ${period_label} is ${status.toUpperCase()}.` + (pay_date ? ` Pay date: ${pay_date}.` : '') + (note ? ` ${note}` : '');
-    for (const t of targets) { const out = await sms.notifyEmployee(t.id, text.slice(0, 450), 'payroll'); out.ok ? sent++ : failed++; }
+    result = await broadcast(targets, `Payroll update: ${period_label} (${status})`, text.slice(0, 450), 'payroll');
   }
-  res.json({ id: r.lastInsertRowid, sms: { sent, failed } });
+  res.json({ id: r.lastInsertRowid, ...result });
 }));
 app.delete('/api/payroll/:id', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
   db.prepare('DELETE FROM payroll_updates WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
-// ---------- Python-powered attendance report ----------
-const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-app.get('/api/reports/attendance', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
-  const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month || '') ? req.query.month : localDate().slice(0, 7);
-  const format = req.query.format === 'csv' ? 'csv' : 'json';
-  const script = path.join(__dirname, 'reports', 'attendance_report.py');
-  execFile(PYTHON, [script, '--db', path.join(__dirname, 'hris.db'), '--month', month, '--format', format, '--today', localDate()],
-    { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        const missing = err.code === 'ENOENT';
-        console.error('[report]', err.message, stderr);
-        return res.status(500).json({ error: missing ? `Python was not found (tried "${PYTHON}"). Install Python 3 or set PYTHON in .env.` : `Report failed: ${(stderr || err.message).slice(0, 300)}` });
-      }
-      if (format === 'csv') {
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', `attachment; filename="attendance-${month}.csv"`);
-        return res.send(stdout);
-      }
-      res.type('json').send(stdout);
-    });
+// ---------- Holidays (external API: Nager.Date) ----------
+app.get('/api/holidays', requireAuth, (req, res) => {
+  const year = /^\d{4}$/.test(req.query.year || '') ? req.query.year : String(new Date().getFullYear());
+  res.json({ year: Number(year), country: holidays.COUNTRY, api: holidays.API,
+    rows: db.prepare("SELECT * FROM holidays WHERE substr(date,1,4) = ? ORDER BY date").all(year) });
 });
+app.post('/api/holidays/sync', requireAuth, requireRole('Admin', 'HR Staff'), wrap(async (req, res) => {
+  const year = Number(req.body.year) || new Date().getFullYear();
+  if (year < 2000 || year > 2100) return res.status(400).json({ error: 'Invalid year.' });
+  const r = await holidays.syncYear(year);
+  audit(req.session.user.id, 'sync_holidays', `${year}: ${r.source || 'failed'}`);
+  if (!r.ok) return res.status(502).json({ error: r.error });
+  res.json(r);
+}));
+app.post('/api/holidays', requireAuth, requireRole('Admin', 'HR Staff'), wrap((req, res) => {
+  const { date, name } = req.body;
+  if (!validDate(date) || !name) return res.status(400).json({ error: 'Date and holiday name are required.' });
+  db.prepare("INSERT INTO holidays (date, name, source) VALUES (?,?, 'manual') ON CONFLICT(date) DO UPDATE SET name = excluded.name, source = 'manual'").run(date, name.trim());
+  audit(req.session.user.id, 'add_holiday', `${date} ${name}`);
+  res.json({ ok: true });
+}));
+app.delete('/api/holidays/:id', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  db.prepare('DELETE FROM holidays WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------- Email log & test ----------
+app.get('/api/email-log', requireAuth, requireRole('Admin', 'HR Staff'), (req, res) => {
+  res.json(db.prepare(`SELECT m.*, e.first_name || ' ' || e.last_name AS employee_name FROM email_log m
+    LEFT JOIN employees e ON e.id = m.employee_id ORDER BY m.id DESC LIMIT 200`).all());
+});
+app.post('/api/email-test', requireAuth, requireRole('Admin'), wrap(async (req, res) => {
+  res.json(await email.sendEmail({ to: req.body.to, subject: 'HRIS test email', text: req.body.message || 'This is a test email from the HRIS.', trigger: 'test' }));
+}));
+
+// ---------- Python: reports and Excel / PDF exports ----------
+const PYTHON = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+const DB_FILE = path.join(__dirname, 'hris.db');
+const MIME = { csv: 'text/csv', json: 'application/json', pdf: 'application/pdf', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+
+function runPython(script, args, binary = false) {
+  return new Promise((resolve, reject) => {
+    execFile(PYTHON, [path.join(__dirname, 'reports', script), ...args],
+      { timeout: 30000, maxBuffer: 30 * 1024 * 1024, encoding: binary ? 'buffer' : 'utf8' }, (err, stdout, stderr) => {
+        if (!err) return resolve(stdout);
+        console.error('[python]', err.message, String(stderr || ''));
+        if (err.code === 'ENOENT') return reject(new Error(`Python was not found (tried "${PYTHON}"). Install Python 3 or set PYTHON in .env.`));
+        let msg = String(stderr || err.message).trim();
+        try { msg = JSON.parse(msg).error || msg; } catch (_) { /* plain text */ }
+        reject(new Error(msg.slice(0, 400)));
+      });
+  });
+}
+const sendFile = (res, buf, format, filename) => {
+  res.setHeader('Content-Type', MIME[format]);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(buf);
+};
+
+app.get('/api/reports/attendance', requireAuth, requireRole('Admin', 'HR Staff'), wrap(async (req, res) => {
+  const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month || '') ? req.query.month : localDate().slice(0, 7);
+  const format = ['csv', 'xlsx', 'pdf'].includes(req.query.format) ? req.query.format : 'json';
+  if (format === 'json' || format === 'csv') {
+    const out = await runPython('attendance_report.py', ['--db', DB_FILE, '--month', month, '--format', format, '--today', localDate()]);
+    return format === 'csv' ? sendFile(res, out, 'csv', `attendance-${month}.csv`) : res.type('json').send(out);
+  }
+  const buf = await runPython('export_report.py', ['attendance', '--db', DB_FILE, '--month', month, '--format', format, '--today', localDate()], true);
+  sendFile(res, buf, format, `attendance-${month}.${format}`);
+}));
+
+app.get('/api/employees/export.xlsx', requireAuth, requireRole('Admin', 'HR Staff'), wrap(async (req, res) => {
+  sendFile(res, await runPython('export_report.py', ['employees', '--db', DB_FILE], true), 'xlsx', 'employees.xlsx');
+}));
+
+// Printable leave request form (employee: own requests only; HR/Admin: any)
+app.get('/api/leave/:id/pdf', requireAuth, wrap(async (req, res) => {
+  const lr = db.prepare('SELECT id, employee_id FROM leave_requests WHERE id = ?').get(req.params.id);
+  if (!lr || (!isStaff(req.session.user) && lr.employee_id !== req.session.user.employeeId)) return res.status(404).json({ error: 'Request not found.' });
+  sendFile(res, await runPython('export_report.py', ['leave-form', '--db', DB_FILE, '--id', String(lr.id)], true), 'pdf', `leave-request-${lr.id}.pdf`);
+}));
 
 // ---------- Dashboard stats ----------
 app.get('/api/dashboard', requireAuth, (req, res) => {
@@ -497,6 +643,7 @@ app.get('/api/audit', requireAuth, requireRole('Admin'), (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+holidays.ensureYears();
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`HRIS running at http://localhost:${PORT}  (SMS provider: ${sms.PROVIDER})`);
   // Show the address a phone on the same Wi-Fi can open

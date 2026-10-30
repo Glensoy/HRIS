@@ -134,6 +134,26 @@ CREATE TABLE IF NOT EXISTS payroll_updates (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS holidays (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  date TEXT UNIQUE NOT NULL,            -- YYYY-MM-DD
+  name TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual' -- api | fallback | manual
+);
+
+CREATE TABLE IF NOT EXISTS email_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+  recipient TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  provider TEXT NOT NULL,               -- smtp | sandbox
+  status TEXT NOT NULL,                 -- sent | failed | sandbox
+  response TEXT,
+  trigger_type TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER REFERENCES users(id),
@@ -142,6 +162,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `);
+
+// ---------- Small migrations for databases created by earlier versions ----------
+function addColumn(table, col, def) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+}
+addColumn('users', 'otp_enabled', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('employees', 'email_opt_in', 'INTEGER NOT NULL DEFAULT 1');
 
 // ---------- Seed ----------
 function seed() {

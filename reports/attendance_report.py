@@ -42,6 +42,11 @@ def build_report(db_path, month, today):
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
 
+    try:
+        holidays = {r[0] for r in con.execute("SELECT date FROM holidays WHERE date BETWEEN ? AND ?", (first.isoformat(), last.isoformat()))}
+    except sqlite3.OperationalError:      # database from an older version without the table
+        holidays = set()
+
     employees = con.execute("""
         SELECT e.id, e.employee_no, e.first_name || ' ' || e.last_name AS name, e.date_hired,
                COALESCE(d.name, '') AS department,
@@ -78,7 +83,8 @@ def build_report(db_path, month, today):
             hired = e["date_hired"] or "0000-00-00"
             # Python weekday(): Mon=0..Sun=6  ->  convert to Sun=0..Sat=6 used by the app
             dow = (d.weekday() + 1) % 7
-            if dow in work_days and iso >= hired:
+            if dow in work_days and iso >= hired and not (iso in holidays and iso not in recs):
+                # public/company holidays are not scheduled days (unless the employee worked that day)
                 scheduled += 1
                 rec = recs.get(iso)
                 if rec and rec["time_in"]:
